@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for unrouted IPv6 addresses every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=v6-stale-sweep.service
+
+[Install]
+WantedBy=timers.target

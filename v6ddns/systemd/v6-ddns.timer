@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for IPv6 address changes every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=v6-ddns.service
+
+[Install]
+WantedBy=timers.target

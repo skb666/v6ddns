@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""certbot DNS-01 hook for Alibaba Cloud DNS.
+
+Used because HTTP-01 cannot work here: b-b.icu is AAAA-only, and Let's Encrypt's
+validation nodes time out reaching this China Telecom residential IPv6 from the
+outside (26/26 probes from other networks succeed, so the path itself is fine).
+
+  auth     create/update the _acme-challenge TXT record
+  cleanup  delete it
+
+certbot invocation (the env file is world-independent, so no V6DDNS_HOME needed):
+  --manual-auth-hook    '/usr/local/bin/alidns-dns01 auth'
+  --manual-cleanup-hook '/usr/local/bin/alidns-dns01 cleanup'
+
+Reads the domain and credentials from /etc/v6-ddns/env.
+"""
+
+import os
+import sys
+
+# The env file is in /etc, so root (certbot) and skb (the DDNS service) read the
+# same one with no identity games and no per-user path juggling.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "v6ddns"))
+import alidns
+
+ENV_FILE = alidns.ENV_FILE
+PREFIX = "_acme-challenge"
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "auth"
+    domain = os.environ.get("CERTBOT_DOMAIN")
+    validation = os.environ.get("CERTBOT_VALIDATION", "")
+    if not domain:
+        sys.exit("alidns-dns01: CERTBOT_DOMAIN is not set")
+
+    cfg = alidns.load_env(ENV_FILE)
+    zone = cfg["V6DDNS_DOMAIN"]
+    client = alidns.Client.from_env(ENV_FILE)
+
+    if mode == "auth":
+        if not validation:
+            sys.exit("alidns-dns01: CERTBOT_VALIDATION is not set")
+        print(client.set_record(zone, PREFIX, "TXT", validation))
+    elif mode == "cleanup":
+        gone = client.delete_matching(zone, PREFIX, "TXT", validation or None)
+        print(f"removed {len(gone)} TXT record(s)" if gone else "nothing to remove")
+    else:
+        sys.exit(f"alidns-dns01: unknown mode {mode!r} (expected auth or cleanup)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except alidns.AlidnsError as exc:
+        sys.exit(f"alidns-dns01: {exc}")

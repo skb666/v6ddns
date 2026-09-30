@@ -1,0 +1,11 @@
+[Unit]
+Description=Drop global IPv6 addresses whose prefix the router stopped advertising
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Needs root: it mutates the kernel address list.
+ExecStart=/usr/local/bin/v6-stale-sweep
+# A failure here is worth seeing in the journal but must never block v6-ddns.
+SuccessExitStatus=0
