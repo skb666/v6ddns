@@ -3,11 +3,11 @@
 # v6-ddns: 一条龙部署脚本
 #
 # 部署内容：
-#   /usr/local/bin/v6-ddns              选址 + 更新 AAAA（以 SVCUSER 身份运行）
+#   /usr/local/bin/v6-ddns              选址 + 更新 AAAA（root 身份运行）
 #   /usr/local/bin/v6-stale-sweep       清理前缀已不可路由的地址（需 root）
 #   /usr/local/bin/alidns-dns01         certbot DNS-01 hook
 #   /usr/local/lib/v6ddns/*.py          共享库
-#   /etc/v6-ddns/env                    阿里云凭据（root:SVCUSER 0640）
+#   /etc/v6-ddns/env                    阿里云凭据（root:root 0600）
 #   /etc/systemd/system/v6-*.{service,timer}
 #   /etc/nginx/conf.d/DOMAIN.conf       80 跳转 443
 #
@@ -19,7 +19,6 @@
 #   --domain NAME      域名（必填）
 #   --token AK,SK      阿里云 AccessKeyId,AccessKeySecret（必填，除非已有 /etc/v6-ddns/env）
 #   --host LABEL       记录标签，默认 @（即根域）
-#   --user NAME        服务运行用户，默认 SUDO_USER 或当前用户
 #   --issue-cert       部署后申请证书（需已装 certbot + python3-certbot-nginx）
 #   --no-nginx         跳过 nginx 配置
 #   --dry-run          只打印将要执行的动作
@@ -33,7 +32,7 @@ CONFDIR=/etc/v6-ddns
 ENVFILE=$CONFDIR/env
 NGINXDIR=/etc/nginx/conf.d
 
-DOMAIN=""; TOKEN=""; HOST="@"; SVCUSER=""; ISSUE_CERT=0; DO_NGINX=1; DRY_RUN=0
+DOMAIN=""; TOKEN=""; HOST="@"; ISSUE_CERT=0; DO_NGINX=1; DRY_RUN=0
 
 die()  { printf '错误: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
@@ -44,20 +43,16 @@ while [ $# -gt 0 ]; do
     --domain)      DOMAIN=${2:?--domain 需要参数}; shift 2 ;;
     --token)       TOKEN=${2:?--token 需要参数}; shift 2 ;;
     --host)        HOST=${2:?--host 需要参数}; shift 2 ;;
-    --user)        SVCUSER=${2:?--user 需要参数}; shift 2 ;;
     --issue-cert)  ISSUE_CERT=1; shift ;;
     --no-nginx)    DO_NGINX=0; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
-    -h|--help)     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "未知参数: $1" ;;
   esac
 done
 
 [ "$(id -u)" = 0 ] || die "请用 sudo 运行"
 [ -n "$DOMAIN" ] || die "必须指定 --domain"
-SVCUSER=${SVCUSER:-${SUDO_USER:-$(logname 2>/dev/null || echo root)}}
-id -u "$SVCUSER" >/dev/null 2>&1 || die "用户 $SVCUSER 不存在"
-
 
 step "前置检查"
 for c in ip python3 systemctl; do
@@ -73,19 +68,18 @@ if [ -z "$TOKEN" ]; then
   [ -f "$ENVFILE" ] || die "既没有 --token，也没有已存在的 $ENVFILE"
   info "沿用现有 $ENVFILE"
 else
-  install -d -m750 -o root -g "$SVCUSER" "$CONFDIR"
+  install -d -m700 -o root -g root "$CONFDIR"
   umask 077
   cat > "$ENVFILE" <<EOF
-# v6-ddns credentials.  Installed as $ENVFILE, root:$SVCUSER 0640.
-# Group-readable so the unprivileged v6-ddns.service (User=$SVCUSER) can read it.
+# v6-ddns credentials.  Installed as $ENVFILE, root:root 0600.
 # Token format: <AccessKeyId>,<AccessKeySecret>
 V6DDNS_PROVIDER=alidns
 V6DDNS_DOMAIN=$DOMAIN
 V6DDNS_HOST=$HOST
 V6DDNS_TOKEN=$TOKEN
 EOF
-  chown root:"$SVCUSER" "$ENVFILE"; chmod 640 "$ENVFILE"
-  info "已写入 $ENVFILE (root:$SVCUSER 0640)"
+  chown root:root "$ENVFILE"; chmod 600 "$ENVFILE"
+  info "已写入 $ENVFILE (root:root 0600)"
 fi
 umask 022
 
@@ -106,7 +100,6 @@ import hashlib
 import hmac
 import json
 import os
-import pwd
 import time
 import urllib.error
 import urllib.parse
@@ -115,18 +108,14 @@ import urllib.request
 API = "https://dns.aliyuncs.com/"
 VERSION = "2015-01-09"
 
-# Per-user state directory, resolved from the calling user rather than from the
-# script's own location, so the same files work when installed into
-# /usr/local/bin and run by root or by an unprivileged systemd service.
-CONFIG_HOME = os.environ.get("V6DDNS_HOME") or pwd.getpwuid(os.getuid()).pw_dir
-
-# Credentials live outside any home directory so that root (the certbot hook)
-# and an unprivileged service (User=skb) can both read one file with no identity
-# games.  V6DDNS_ENV still overrides the location for unusual setups.
+# Credentials live outside any home directory: certbot's hook and v6-ddns.service
+# both run as root, so one root-only file serves both with no identity games.
+# V6DDNS_ENV still overrides the location for unusual setups.
 ENV_FILE = os.environ.get("V6DDNS_ENV") or "/etc/v6-ddns/env"
-# State stays per-user: v6-dns runs unprivileged and must write it, and nothing
-# outside the user's home needs to see it.
-STATE_FILE = os.path.join(CONFIG_HOME, ".local", "state", "v6-ddns", "address")
+# Fixed path, not per-user: the timer and a manual `v6-ddns` run must share one
+# state file, or a run under a different account writes state the timer never
+# sees.  The unit's StateDirectory= creates this directory for us.
+STATE_FILE = "/var/lib/v6-ddns/address"
 
 
 class AlidnsError(Exception):
@@ -326,10 +315,10 @@ __V6DDNS_IPV6STATE_PY__
 """Publish this host's stable-privacy IPv6 as a DNS AAAA record.
 
 Detects the uplink's global IPv6 and updates DNS only when the address actually
-changed.  stdlib only -- no packages to install, no root needed.
+changed.  stdlib only -- no packages to install.
 
-Credentials: /etc/v6-ddns/env  (root:skb 0640)
-State:       ~/.local/state/v6-ddns/address
+Credentials: /etc/v6-ddns/env  (root:root 0600)
+State:       /var/lib/v6-ddns/address
 
   v6-ddns            update DNS if the address changed
   v6-ddns --dry-run  report what would happen; touches no DNS and no state
@@ -579,7 +568,7 @@ outside (26/26 probes from other networks succeed, so the path itself is fine).
   auth     create/update the _acme-challenge TXT record
   cleanup  delete it
 
-certbot invocation (the env file is world-independent, so no V6DDNS_HOME needed):
+certbot invocation (the env file and the state path are world-independent):
   --manual-auth-hook    '/usr/local/bin/alidns-dns01 auth'
   --manual-cleanup-hook '/usr/local/bin/alidns-dns01 cleanup'
 
@@ -589,8 +578,8 @@ Reads the domain and credentials from /etc/v6-ddns/env.
 import os
 import sys
 
-# The env file is in /etc, so root (certbot) and skb (the DDNS service) read the
-# same one with no identity games and no per-user path juggling.
+# The env file is in /etc, so certbot and v6-ddns.service read the same one with
+# no per-user path juggling.
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "v6ddns"))
 import alidns
@@ -705,16 +694,11 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/v6-ddns
-# Runs unprivileged.  The script resolves its config from the calling user, so
-# User= is what makes ~/.config/v6-ddns/env and ~/.local/state reachable.
-User=@USER@
-Group=@USER@
+StateDirectory=v6-ddns
+ProtectHome=true
 NoNewPrivileges=true
 PrivateTmp=true
-# ProtectHome is deliberately not set: the config and state files live in the
-# user's home, so sandboxing it would break the service outright.
 __V6DDNS_DDNS_SERVICE__
-	sed -i "s|@USER@|$SVCUSER|g" "$UNITDIR/v6-ddns.service"
 	info "已安装 $UNITDIR/v6-ddns.service (mode 644)"
 	install -m644 /dev/stdin "$UNITDIR/v6-ddns.timer" <<'__V6DDNS_DDNS_TIMER__'
 [Unit]

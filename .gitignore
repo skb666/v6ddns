@@ -1,0 +1,9 @@
+# serena (MCP) 的项目状态，不是源码
+/.serena/
+
+# python 字节码（本仓库的 bin/ 和 lib/ 是可执行的 .py）
+__pycache__/
+*.pyc
+
+# 凭据模板的同目录实体文件，含明文 AccessKey（见 README「不要进 git」）
+/v6ddns/env

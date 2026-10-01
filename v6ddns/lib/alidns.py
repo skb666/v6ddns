@@ -10,7 +10,6 @@ import hashlib
 import hmac
 import json
 import os
-import pwd
 import time
 import urllib.error
 import urllib.parse
@@ -19,18 +18,14 @@ import urllib.request
 API = "https://dns.aliyuncs.com/"
 VERSION = "2015-01-09"
 
-# Per-user state directory, resolved from the calling user rather than from the
-# script's own location, so the same files work when installed into
-# /usr/local/bin and run by root or by an unprivileged systemd service.
-CONFIG_HOME = os.environ.get("V6DDNS_HOME") or pwd.getpwuid(os.getuid()).pw_dir
-
-# Credentials live outside any home directory so that root (the certbot hook)
-# and an unprivileged service (User=skb) can both read one file with no identity
-# games.  V6DDNS_ENV still overrides the location for unusual setups.
+# Credentials live outside any home directory: certbot's hook and v6-ddns.service
+# both run as root, so one root-only file serves both with no identity games.
+# V6DDNS_ENV still overrides the location for unusual setups.
 ENV_FILE = os.environ.get("V6DDNS_ENV") or "/etc/v6-ddns/env"
-# State stays per-user: v6-dns runs unprivileged and must write it, and nothing
-# outside the user's home needs to see it.
-STATE_FILE = os.path.join(CONFIG_HOME, ".local", "state", "v6-ddns", "address")
+# Fixed path, not per-user: the timer and a manual `v6-ddns` run must share one
+# state file, or a run under a different account writes state the timer never
+# sees.  The unit's StateDirectory= creates this directory for us.
+STATE_FILE = "/var/lib/v6-ddns/address"
 
 
 class AlidnsError(Exception):

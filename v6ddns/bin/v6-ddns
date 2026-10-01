@@ -2,10 +2,10 @@
 """Publish this host's stable-privacy IPv6 as a DNS AAAA record.
 
 Detects the uplink's global IPv6 and updates DNS only when the address actually
-changed.  stdlib only -- no packages to install, no root needed.
+changed.  stdlib only -- no packages to install.
 
-Credentials: /etc/v6-ddns/env  (root:skb 0640)
-State:       ~/.local/state/v6-ddns/address
+Credentials: /etc/v6-ddns/env  (root:root 0600)
+State:       /var/lib/v6-ddns/address
 
   v6-ddns            update DNS if the address changed
   v6-ddns --dry-run  report what would happen; touches no DNS and no state

@@ -8,7 +8,7 @@ outside (26/26 probes from other networks succeed, so the path itself is fine).
   auth     create/update the _acme-challenge TXT record
   cleanup  delete it
 
-certbot invocation (the env file is world-independent, so no V6DDNS_HOME needed):
+certbot invocation (the env file and the state path are world-independent):
   --manual-auth-hook    '/usr/local/bin/alidns-dns01 auth'
   --manual-cleanup-hook '/usr/local/bin/alidns-dns01 cleanup'
 
@@ -18,8 +18,8 @@ Reads the domain and credentials from /etc/v6-ddns/env.
 import os
 import sys
 
-# The env file is in /etc, so root (certbot) and skb (the DDNS service) read the
-# same one with no identity games and no per-user path juggling.
+# The env file is in /etc, so certbot and v6-ddns.service read the same one with
+# no per-user path juggling.
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "v6ddns"))
 import alidns

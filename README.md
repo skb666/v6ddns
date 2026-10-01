@@ -30,7 +30,6 @@ sudo ./v6-ddns-install.sh \
 | `--domain NAME` | 域名，**必填** |
 | `--token AK,SK` | 阿里云凭据。省略则沿用已有 `/etc/v6-ddns/env` |
 | `--host LABEL` | 记录标签，默认 `@`（根域）。`home` → `home.example.com` |
-| `--user NAME` | 服务运行用户，默认 `SUDO_USER`。**建议不要设为 root** |
 | `--issue-cert` | 部署后立即申请证书 |
 | `--no-nginx` | 跳过 nginx vhost |
 | `--dry-run` | 只打印不执行 |
@@ -147,7 +146,7 @@ sudo ./v6-ddns-install.sh \
     --issue-cert
 ```
 
-凭据落在 `/etc/v6-ddns/env`（`root:<你的用户> 0640`）。**这个文件里有明文
+凭据落在 `/etc/v6-ddns/env`（`root:root 0600`）。**这个文件里有明文
 AccessKey，不要进 git。**
 
 安装脚本调用阿里云 API 用的签名是 AliRPC HMAC-SHA1，双层编码（`:` → `%3A`
@@ -274,7 +273,7 @@ ip -6 route show dev enp7s0 proto ra
 
 | 单元 | 频率 | 作用 | 身份 |
 |---|---|---|---|
-| `v6-ddns.timer` | 5 分钟 | 选址 → 变了才调 API | `User=<你的用户>` |
+| `v6-ddns.timer` | 5 分钟 | 选址 → 变了才调 API | root |
 | `v6-stale-sweep.timer` | 5 分钟 | 删掉不可路由的旧地址 | root |
 
 清理器让内核不再拿死地址做出站源地址。两个任务相互独立 —— 即使清理器
@@ -343,14 +342,14 @@ sudo nginx -t && sudo systemctl reload nginx && echo "hook 可用"
 /usr/local/bin/alidns-dns01         certbot hook
 /usr/local/lib/v6ddns/alidns.py     阿里云 API 客户端（HMAC-SHA1 签名）
 /usr/local/lib/v6ddns/ipv6state.py  地址状态判定
-/etc/v6-ddns/env                    凭据，root:<用户> 0640
+/etc/v6-ddns/env                    凭据，root:root 0600
 /etc/systemd/system/v6-*.{service,timer}
 /etc/nginx/conf.d/example.com.conf  80 跳 443
 ```
 
-凭据放 `/etc` 而不是家目录，是为了让 root（certbot hook）和非特权的
-`v6-ddns.service` 读同一个文件，不需要任何身份切换。`0640 root:<用户>`
-让两者都能读，其他用户读不到。
+凭据放 `/etc` 而不是家目录，是因为 certbot hook 和 `v6-ddns.service` 都以
+root 身份运行，读同一个文件，不需要任何身份切换。`0600 root:root` 只有
+root 能读，其他用户读不到。
 
 **这个文件里有明文 AccessKey。** 不要进 git。
 

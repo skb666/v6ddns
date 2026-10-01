@@ -6,11 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/v6-ddns
-# Runs unprivileged.  The script resolves its config from the calling user, so
-# User= is what makes ~/.config/v6-ddns/env and ~/.local/state reachable.
-User=ddns
-Group=ddns
+StateDirectory=v6-ddns
+ProtectHome=true
 NoNewPrivileges=true
 PrivateTmp=true
-# ProtectHome is deliberately not set: the config and state files live in the
-# user's home, so sandboxing it would break the service outright.
