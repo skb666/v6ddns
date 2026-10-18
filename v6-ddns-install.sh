@@ -5,23 +5,24 @@
 # 部署内容：
 #   /usr/local/bin/v6-ddns              选址 + 更新 AAAA（root 身份运行）
 #   /usr/local/bin/v6-stale-sweep       清理前缀已不可路由的地址（需 root）
-#   /usr/local/bin/alidns-dns01         certbot DNS-01 hook
+#   /usr/local/bin/cloudflare-dns01     certbot DNS-01 hook
 #   /usr/local/lib/v6ddns/*.py          共享库
-#   /etc/v6-ddns/env                    阿里云凭据（root:root 0600）
+#   /etc/v6-ddns/env                    Cloudflare 凭据（root:root 0600）
 #   /etc/systemd/system/v6-*.{service,timer}
 #   /etc/nginx/conf.d/DOMAIN.conf       80 跳转 443
 #
 # 用法：
-#   sudo ./v6-ddns-install.sh --domain example.com --token AKID,AKSECRET
-#   sudo ./v6-ddns-install.sh --domain example.com --token AK,SK --issue-cert
+#   sudo ./v6-ddns-install.sh --domain example.com --zone-id ZONE_ID --token API_TOKEN
+#   sudo ./v6-ddns-install.sh --domain example.com --zone-id ZONE_ID --token API_TOKEN --issue-cert
 #
 # 选项：
 #   --domain NAME      域名（必填）
-#   --token AK,SK      阿里云 AccessKeyId,AccessKeySecret（必填，除非已有 /etc/v6-ddns/env）
+#   --zone-id ID       Cloudflare 控制台中的 Zone ID（也可用 V6DDNS_ZONE_ID）
+#   --token TOKEN      Cloudflare API Token（也可用 V6DDNS_TOKEN）；可沿用同域 Cloudflare 配置
 #   --host LABEL       记录标签，默认 @（即根域）
 #   --issue-cert       部署后申请证书（需已装 certbot + python3-certbot-nginx）
 #   --no-nginx         跳过 nginx 配置
-#   --dry-run          只打印将要执行的动作
+#   --dry-run          校验并打印计划，不写盘、不调用 API、不要求 root、不显示 Token
 #
 set -euo pipefail
 
@@ -32,96 +33,218 @@ CONFDIR=/etc/v6-ddns
 ENVFILE=$CONFDIR/env
 NGINXDIR=/etc/nginx/conf.d
 
-DOMAIN=""; TOKEN=""; HOST="@"; ISSUE_CERT=0; DO_NGINX=1; DRY_RUN=0
+DOMAIN=""; ZONE_ID=${V6DDNS_ZONE_ID:-}; TOKEN=${V6DDNS_TOKEN:-}
+HOST="@"; HOST_SET=0; ISSUE_CERT=0; DO_NGINX=1; DRY_RUN=0
 
 die()  { printf '错误: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+need_value() { [ $# -ge 2 ] && [ -n "$2" ] && [[ $2 != --* ]] || die "$1 需要参数"; }
+
+valid_name() {
+  local label
+  local -a labels
+  [ ${#1} -le 253 ] && [[ $1 =~ ^[a-zA-Z0-9.-]+$ && $1 != .* && $1 != *. && $1 != *..* ]] || return 1
+  IFS=. read -r -a labels <<< "$1"
+  [ ${#labels[@]} -gt 0 ] || return 1
+  for label in "${labels[@]}"; do
+    [ ${#label} -le 63 ] && [[ $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+  done
+}
+
+trim() {
+  REPLY=${1#"${1%%[![:space:]]*}"}
+  REPLY=${REPLY%"${REPLY##*[![:space:]]}"}
+}
 
 while [ $# -gt 0 ]; do
   case $1 in
-    --domain)      DOMAIN=${2:?--domain 需要参数}; shift 2 ;;
-    --token)       TOKEN=${2:?--token 需要参数}; shift 2 ;;
-    --host)        HOST=${2:?--host 需要参数}; shift 2 ;;
+    --domain)      need_value "$@"; DOMAIN=$2; shift 2 ;;
+    --zone-id)     need_value "$@"; ZONE_ID=$2; shift 2 ;;
+    --token)       need_value "$@"; TOKEN=$2; shift 2 ;;
+    --host)        need_value "$@"; HOST=$2; HOST_SET=1; shift 2 ;;
     --issue-cert)  ISSUE_CERT=1; shift ;;
     --no-nginx)    DO_NGINX=0; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
-    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *)             die "未知参数: $1" ;;
+    -h|--help)     sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)             die "未知参数，请使用 --help" ;;
   esac
 done
 
-[ "$(id -u)" = 0 ] || die "请用 sudo 运行"
 [ -n "$DOMAIN" ] || die "必须指定 --domain"
+valid_name "$DOMAIN" || die "--domain 格式无效"
+DOMAIN=${DOMAIN,,}
+
+# 配置只按数据读取，不 source，避免把凭据文件中的内容当命令执行。
+REUSE=0
+OLD_EXTRA=()
+if [ -f "$ENVFILE" ]; then
+  OLD_PROVIDER=""; OLD_DOMAIN=""; OLD_HOST="@"; OLD_ZONE=""; OLD_TOKEN=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    original=$line
+    trim "$line"; line=$REPLY
+    if [[ $line == \#* || $line != *=* ]]; then
+      OLD_EXTRA+=("$original")
+      continue
+    fi
+    trim "${line%%=*}"; key=$REPLY
+    trim "${line#*=}"; value=$REPLY
+    if [[ $value == \"*\" || $value == \'*\' ]]; then
+      value=${value:1:${#value}-2}
+    fi
+    case $key in
+      V6DDNS_PROVIDER) OLD_PROVIDER=$value ;;
+      V6DDNS_DOMAIN) OLD_DOMAIN=$value ;;
+      V6DDNS_HOST) OLD_HOST=$value ;;
+      V6DDNS_ZONE_ID) OLD_ZONE=$value ;;
+      V6DDNS_TOKEN) OLD_TOKEN=$value ;;
+      *) OLD_EXTRA+=("$original") ;;
+    esac
+  done < "$ENVFILE"
+  if [ "$OLD_PROVIDER" = cloudflare ] && [ "${OLD_DOMAIN,,}" = "$DOMAIN" ]; then
+    if [ "$HOST_SET" = 1 ]; then
+      [ "${HOST,,}" = "${OLD_HOST,,}" ] || die "显式 --host 与现有配置不匹配"
+    else
+      HOST=$OLD_HOST
+    fi
+    ZONE_ID=${ZONE_ID:-$OLD_ZONE}
+    TOKEN=${TOKEN:-$OLD_TOKEN}
+    REUSE=1
+  else
+    [ -n "$ZONE_ID" ] && [ -n "$TOKEN" ] || die "现有配置为旧平台或其他 domain；请显式提供全新 --zone-id 和 --token"
+  fi
+fi
+[ -n "$ZONE_ID" ] || die "必须指定 --zone-id 或 V6DDNS_ZONE_ID（或沿用同域 Cloudflare 配置）"
+[[ $ZONE_ID =~ ^[a-fA-F0-9]{32}$ ]] || die "--zone-id 必须为 32 位十六进制 Zone ID"
+[ -n "$TOKEN" ] || die "必须指定 --token 或 V6DDNS_TOKEN（或沿用同域 Cloudflare 配置）"
+[[ $TOKEN =~ ^[a-zA-Z0-9_-]+$ ]] || die "--token 必须为 Cloudflare API Token，不能使用旧平台 AK,SK"
+if [ "$HOST" != @ ]; then
+  valid_name "$HOST" || die "--host 格式无效"
+  [ ${#HOST} -le $((252 - ${#DOMAIN})) ] || die "--host 与 domain 组合过长"
+fi
+HOST=${HOST,,}
+RENEWAL_FILE="/etc/letsencrypt/renewal/$DOMAIN.conf"
+
+check_lineage() {
+  python3 - "$RENEWAL_FILE" "/etc/letsencrypt/live/$DOMAIN" "$DO_NGINX" "$BINDIR/cloudflare-dns01" "$1" <<'PY'
+import configparser
+from pathlib import Path
+import re
+import sys
+
+path, live, nginx, hook, saved = sys.argv[1:]
+try:
+    text = Path(path).read_text()
+    # 预检只在内存忽略脚本自有重复键；实际清理在 Certbot 读取前完成。
+    text = re.sub(r"^[ \t]*renew_hook[ \t]*=[ \t]*systemctl reload nginx[ \t]*$\n?", "", text, flags=re.M)
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read_string("[lineage]\n" + text)
+    for key, filename in (("fullchain", "fullchain.pem"), ("privkey", "privkey.pem")):
+        if cfg.get("lineage", key, fallback="") != f"{live}/{filename}":
+            raise ValueError("同名 renewal 的证书路径不匹配；请核对 --cert-name 和实际 lineage，不猜测 -0001")
+    params = cfg["renewalparams"]
+    if nginx == "0" and params.get("installer", "").lower() == "nginx":
+        raise ValueError("现有 lineage 的 installer=nginx；--no-nginx 不会移除旧 installer，请先用 Certbot 明确处理该配置")
+    if saved == "saved":
+        if (params.get("authenticator") != "manual"
+                or params.get("pref_challs", "").strip(" ,") not in ("dns", "dns-01")
+                or params.get("manual_auth_hook") != f"{hook} auth"
+                or params.get("manual_cleanup_hook") != f"{hook} cleanup"):
+            raise ValueError("Cloudflare manual/DNS-01 auth/cleanup 未正确持久化")
+except (OSError, ValueError, KeyError, configparser.Error) as exc:
+    sys.exit(f"错误: renewal 配置校验失败: {exc}")
+PY
+}
+
+if [ "$DRY_RUN" = 1 ]; then
+  step "DRY-RUN：仅校验并展示计划，不实际写入"
+  NAME=$DOMAIN; [ "$HOST" = @ ] || NAME=$HOST.$DOMAIN
+  info "Cloudflare: $NAME AAAA；Zone ID: $ZONE_ID；Token: 已提供（隐藏）"
+  info "凭据: $ENVFILE (root:root 0600)；状态: /var/lib/v6-ddns/address"
+  info "程序: $BINDIR/v6-ddns、$BINDIR/v6-stale-sweep、$BINDIR/cloudflare-dns01"
+  info "共享库: $LIBDIR/cloudflare.py、$LIBDIR/ipv6state.py；启用两个 systemd timer"
+  [ "$REUSE" = 0 ] || info "沿用同域 Cloudflare 配置"
+  [ "$DO_NGINX" = 0 ] || info "配置 nginx vhost: $NGINXDIR/$DOMAIN.conf"
+  if [ "$ISSUE_CERT" = 1 ]; then
+    info "certbot DNS-01: cloudflare-dns01 auth / cleanup；无人值守续期"
+    [ "$DO_NGINX" = 0 ] || info "申请成功后检查并 reload nginx；保存限域 deploy hook，保留自定义 renew_hook"
+  fi
+  exit 0
+fi
+
+[ "$(id -u)" = 0 ] || die "请用 sudo 运行"
 
 step "前置检查"
 for c in ip python3 systemctl; do
   command -v $c >/dev/null || die "缺少命令: $c"
   info "$c ✓"
 done
-if [ "$DRY_RUN" = 1 ]; then
-  info "DRY-RUN: 不实际写入"
+if [ "$ISSUE_CERT" = 1 ]; then
+  command -v certbot >/dev/null || die "缺少命令: certbot"
+  [ "$DO_NGINX" = 0 ] || command -v nginx >/dev/null || die "缺少命令: nginx"
+  CERTBOT_VERSION=$(certbot --version 2>&1) || die "无法检查 Certbot 版本"
+  if [[ $CERTBOT_VERSION =~ certbot[[:space:]]+([0-9]+)\.([0-9]+) ]]; then
+    [ "${BASH_REMATCH[1]}" -gt 2 ] || { [ "${BASH_REMATCH[1]}" -eq 2 ] && [ "${BASH_REMATCH[2]}" -ge 3 ]; } || die "需要 Certbot >= 2.3"
+  else
+    die "无法识别 Certbot 版本；需要 >= 2.3"
+  fi
+  certbot help reconfigure >/dev/null 2>&1 || die "Certbot 不支持 reconfigure；需要 >= 2.3"
+  if [ -f "$RENEWAL_FILE" ]; then
+    check_lineage existing
+  elif [ -e "/etc/letsencrypt/live/$DOMAIN" ]; then
+    die "存在同名 live 目录但缺少 renewal；请先核对实际 lineage"
+  fi
+fi
+if [ "$DO_NGINX" = 1 ]; then
+  for file in options-ssl-nginx.conf ssl-dhparams.pem; do
+    [ -s "/etc/letsencrypt/$file" ] || die "缺少 nginx TLS 配套文件 /etc/letsencrypt/$file；请按 README 从本机匹配版本 Certbot 包补齐，或使用 --no-nginx"
+  done
 fi
 
 step "凭据 $ENVFILE"
-if [ -z "$TOKEN" ]; then
-  [ -f "$ENVFILE" ] || die "既没有 --token，也没有已存在的 $ENVFILE"
+install -d -m700 -o root -g root "$CONFDIR"
+umask 077
+if [ "$REUSE" = 1 ] && [ "$ZONE_ID" = "$OLD_ZONE" ] && [ "$TOKEN" = "$OLD_TOKEN" ]; then
   info "沿用现有 $ENVFILE"
 else
-  install -d -m700 -o root -g root "$CONFDIR"
-  umask 077
   cat > "$ENVFILE" <<EOF
-# v6-ddns credentials.  Installed as $ENVFILE, root:root 0600.
-# Token format: <AccessKeyId>,<AccessKeySecret>
-V6DDNS_PROVIDER=alidns
+# Cloudflare 凭据，安装为 $ENVFILE，root:root 0600；不要提交到 git。
+V6DDNS_PROVIDER=cloudflare
+V6DDNS_ZONE_ID=$ZONE_ID
 V6DDNS_DOMAIN=$DOMAIN
 V6DDNS_HOST=$HOST
 V6DDNS_TOKEN=$TOKEN
 EOF
-  chown root:root "$ENVFILE"; chmod 600 "$ENVFILE"
-  info "已写入 $ENVFILE (root:root 0600)"
+  if [ "$REUSE" = 1 ] && [ ${#OLD_EXTRA[@]} -gt 0 ]; then
+    printf '%s\n' "${OLD_EXTRA[@]}" >> "$ENVFILE"
+  fi
 fi
+chown root:root "$ENVFILE"; chmod 600 "$ENVFILE"
+info "已写入 $ENVFILE (root:root 0600)"
 umask 022
 
 step "安装程序文件"
 install -d -m755 "$LIBDIR" "$BINDIR" "$UNITDIR"
 [ "$DO_NGINX" = 1 ] && install -d -m755 "$NGINXDIR"
 
-	install -m644 /dev/stdin "$LIBDIR/alidns.py" <<'__V6DDNS_ALIDNS_PY__'
-"""Minimal Alibaba Cloud DNS (alidns) RPC client -- stdlib only.
+	install -m644 /dev/stdin "$LIBDIR/cloudflare.py" <<'__V6DDNS_CLOUDFLARE_PY__'
+"""供 DDNS 与 certbot DNS-01 共用的 Cloudflare 客户端，仅使用标准库。"""
 
-Shared by v6-ddns, v6-stale-sweep and the certbot DNS-01 hook so the HMAC-SHA1
-signing exists in exactly one place.  Credentials come from the KEY=VALUE file
-named by ENV_FILE (/etc/v6-ddns/env unless V6DDNS_ENV overrides it).
-"""
-
-import base64
-import hashlib
-import hmac
+import ipaddress
 import json
 import os
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 
-API = "https://dns.aliyuncs.com/"
-VERSION = "2015-01-09"
-
-# Credentials live outside any home directory: certbot's hook and v6-ddns.service
-# both run as root, so one root-only file serves both with no identity games.
-# V6DDNS_ENV still overrides the location for unusual setups.
+API = "https://api.cloudflare.com/client/v4"
 ENV_FILE = os.environ.get("V6DDNS_ENV") or "/etc/v6-ddns/env"
-# Fixed path, not per-user: the timer and a manual `v6-ddns` run must share one
-# state file, or a run under a different account writes state the timer never
-# sees.  The unit's StateDirectory= creates this directory for us.
 STATE_FILE = "/var/lib/v6-ddns/address"
 
 
-class AlidnsError(Exception):
-    def __init__(self, code, message, action=""):
-        super().__init__(f"alidns {action} failed: {code}: {message}".strip())
-        self.code = code
+class CloudflareError(Exception):
+    pass
 
 
 def load_env(path):
@@ -130,101 +253,148 @@ def load_env(path):
         for line in fh:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
-                key, _, val = line.partition("=")
-                cfg[key.strip()] = val.strip().strip("'\"")
+                key, _, value = line.partition("=")
+                cfg[key.strip()] = value.strip().strip("'\"")
     return cfg
 
 
-def sign(params, secret, method="GET"):
-    """AliRPC SignatureVersion 1.0.
-
-    Two encoding passes: each key/value is encoded, then the joined string is
-    encoded again -- which is why Alibaba echoes the timestamp as %253A
-    (':' -> %3A -> %253A).  Verified against the live API.
-    """
-    enc = lambda s: urllib.parse.quote(str(s), safe="-._~")
-    canonical = "&".join(f"{enc(k)}={enc(v)}" for k, v in sorted(params.items()))
-    string_to_sign = f"{method}&%2F&{enc(canonical)}"
-    mac = hmac.new((secret + "&").encode(), string_to_sign.encode(), hashlib.sha1).digest()
-    return base64.b64encode(mac).decode()
+def _txt_value(value):
+    return value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value
 
 
 class Client:
-    def __init__(self, key_id, secret):
-        self.key_id, self.secret = key_id, secret
+    def __init__(self, token, zone_id):
+        if not token or not zone_id:
+            raise CloudflareError("V6DDNS_TOKEN and V6DDNS_ZONE_ID are required")
+        self.token, self.zone_id = token, zone_id
+        self.path = f"/zones/{urllib.parse.quote(zone_id, safe='')}/dns_records"
 
     @classmethod
-    def from_env(cls, cfg_path, key="V6DDNS_TOKEN"):
-        raw = load_env(cfg_path).get(key, "")
-        key_id, _, secret = raw.partition(",")
-        if not key_id or not secret:
-            raise AlidnsError("NoCredential", f"{key} must be '<AccessKeyId>,<AccessKeySecret>'")
-        return cls(key_id, secret)
+    def from_env(cls, path):
+        cfg = load_env(path)
+        return cls(cfg.get("V6DDNS_TOKEN"), cfg.get("V6DDNS_ZONE_ID"))
 
-    def call(self, action, **extra):
-        params = {
-            "AccessKeyId": self.key_id,
-            "Action": action,
-            "Format": "JSON",
-            "SignatureMethod": "HMAC-SHA1",
-            "SignatureNonce": f"{int(time.time() * 1000)}-{self.key_id[-6:]}",
-            "SignatureVersion": "1.0",
-            "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "Version": VERSION,
-            **extra,
-        }
-        params["Signature"] = sign(params, self.secret)
+    def _call(self, method, path, payload=None):
+        status = None
+
+        def error(detail):
+            target = f"{method} {path}" + (f" -> HTTP {status}" if status is not None else "")
+            # 先脱敏再截断，避免截断后的 token 前缀泄漏。
+            detail = str(detail).replace(self.token, "[REDACTED]")
+            if len(detail) > 300:
+                detail = detail[:300] + "..."
+            return CloudflareError(f"{target}: {detail}".replace(self.token, "[REDACTED]"))
+
         req = urllib.request.Request(
-            API + "?" + urllib.parse.urlencode(params), headers={"User-Agent": "alidns-py/1"})
+            API + path, method=method,
+            data=json.dumps(payload).encode() if payload is not None else None,
+            headers={"Authorization": f"Bearer {self.token}",
+                     "Content-Type": "application/json", "User-Agent": "v6-ddns/1"})
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read().decode())
+            with urllib.request.urlopen(req, timeout=30) as response:
+                status = response.status
+                raw = response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")
-            try:
-                body = json.loads(detail)
-            except json.JSONDecodeError:
-                raise AlidnsError(f"HTTP{exc.code}", detail[:300], action)
-            raise AlidnsError(body.get("Code", f"HTTP{exc.code}"),
-                              body.get("Message", ""), action)
-        except urllib.error.URLError as exc:
-            raise AlidnsError("NetworkError", str(exc.reason), action)
-        # Some AliDNS failures come back as HTTP 200 with an error body.
-        if "Code" in body:
-            raise AlidnsError(body["Code"], body.get("Message", ""), action)
+            status = exc.code
+            raw = exc.read().decode("utf-8", "replace")
+        except OSError as exc:
+            raise error(f"request failed: {exc}") from exc
+        try:
+            body = json.loads(raw)
+        except ValueError as exc:
+            raise error(f"non-JSON response: {raw}") from exc
+        if not isinstance(body, dict):
+            raise error("invalid response")
+        if status >= 400 or body.get("errors"):
+            errors = body.get("errors")
+            details = "; ".join(f"{item.get('code', '')}: {item.get('message', '')}"
+                                for item in errors if isinstance(item, dict)) if isinstance(errors, list) else ""
+            raise error(details or "invalid or unsuccessful response")
+        # DELETE 的官方响应允许省略 success，但仍须由调用方核对 result.id。
+        if body.get("success") is not True and not (method == "DELETE" and "success" not in body):
+            raise error("Cloudflare did not confirm success")
         return body
 
+    @staticmethod
+    def _record(rec, name, rtype):
+        if (not isinstance(rec, dict) or not isinstance(rec.get("id"), str) or not rec["id"]
+                or not isinstance(rec.get("name"), str)
+                or rec["name"].rstrip(".").lower() != name.rstrip(".").lower()
+                or rec.get("type") != rtype or not isinstance(rec.get("content"), str)):
+            raise CloudflareError("invalid DNS record result")
+        if rtype == "AAAA":
+            try:
+                ipaddress.IPv6Address(rec["content"])
+            except ValueError as exc:
+                raise CloudflareError("invalid AAAA content") from exc
+        return rec
+
     def records(self, name, rtype):
-        """All records of rtype at name.  A trailing dot silently matches nothing,
-        so the root zone is addressed as "@.domain" (both forms verified live)."""
-        reply = self.call("DescribeSubDomainRecords", SubDomain=name, Type=rtype)
-        return (reply.get("DomainRecords") or {}).get("Record") or []
+        found = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode({"name.exact": name, "type": rtype,
+                                            "page": page, "per_page": 100})
+            body = self._call("GET", self.path + "?" + query)
+            records = body.get("result")
+            info = body.get("result_info")
+            pages = info.get("total_pages") if isinstance(info, dict) else None
+            if (not isinstance(records, list) or type(pages) is not int or pages < 0
+                    or (pages < page and not (page == 1 and pages == 0 and not records))):
+                raise CloudflareError("invalid DNS record list or pagination")
+            found.extend(self._record(rec, name, rtype) for rec in records)
+            if page >= pages:
+                return found
+            page += 1
 
-    def set_record(self, domain, rr, rtype, value, ttl=600):
-        """Create or update.  AliDNS rejects a no-op update with
-        DomainRecordDuplicate, so an unchanged value short-circuits here."""
-        found = self.records(f"{rr}.{domain}", rtype)
-        common = {"RR": rr, "Type": rtype, "Value": value, "TTL": int(ttl)}
+    def _write(self, method, name, rtype, value, payload, rid=None):
+        path = self.path + ("/" + urllib.parse.quote(rid, safe="") if rid else "")
+        rec = self._record(self._call(method, path, payload).get("result"), name, rtype)
+        matches = (ipaddress.IPv6Address(rec["content"]) == ipaddress.IPv6Address(value)
+                   if rtype == "AAAA" else _txt_value(rec["content"]) == _txt_value(value))
+        if not matches or (rid is not None and rec["id"] != rid):
+            raise CloudflareError("DNS write result does not match the requested record")
+        return rec["id"]
+
+    def set_aaaa(self, name, address, ttl=120):
+        found = self.records(name, "AAAA")
+        if len(found) > 1:
+            warnings.warn(f"{len(found)} AAAA records exist for {name}; only the first is "
+                          "kept in sync -- delete the others or clients will round-robin "
+                          "onto a stale address", stacklevel=2)
         if found:
-            if found[0].get("Value") == value:
-                return f"unchanged {rr}.{domain} {rtype} id={found[0]['RecordId']}"
-            self.call("UpdateDomainRecord", RecordId=found[0]["RecordId"], **common)
-            return f"updated {rr}.{domain} {rtype} {found[0].get('Value')} -> {value}"
-        created = self.call("AddDomainRecord", DomainName=domain, **common)
-        return f"created {rr}.{domain} {rtype} id={created.get('RecordId')}"
+            rec = found[0]
+            if ipaddress.IPv6Address(rec["content"]) == ipaddress.IPv6Address(address):
+                return f"unchanged AAAA {name} (id {rec['id']})"
+            rid = self._write("PATCH", name, "AAAA", address, {"content": address}, rec["id"])
+            return f"updated AAAA {name} (id {rid})"
+        rid = self._write("POST", name, "AAAA", address,
+                          {"type": "AAAA", "name": name, "content": address,
+                           "ttl": int(ttl), "proxied": False})
+        return f"created AAAA {name} (id {rid})"
 
-    def delete_matching(self, domain, rr, rtype, value=None):
-        """Delete records at rr.domain of rtype.  If value is given, only records
-        whose value matches are removed; otherwise every record of that type."""
+    def add_txt(self, name, value, ttl=120):
+        if not value:
+            raise CloudflareError("TXT validation value is required")
+        return self._write("POST", name, "TXT", value,
+                           {"type": "TXT", "name": name, "content": value, "ttl": int(ttl)})
+
+    def delete_txt(self, name, value):
+        if not value:
+            raise CloudflareError("TXT validation value is required for cleanup")
         gone = []
-        for rec in self.records(f"{rr}.{domain}", rtype):
-            if value is not None and rec.get("Value") != value:
+        for rec in self.records(name, "TXT"):
+            # content.exact 不区分大小写，挑战值必须在本地严格匹配。
+            if _txt_value(rec["content"]) != _txt_value(value):
                 continue
-            self.call("DeleteDomainRecord", RecordId=rec["RecordId"])
-            gone.append(rec["RecordId"])
+            body = self._call("DELETE", self.path + "/" + urllib.parse.quote(rec["id"], safe=""))
+            result = body.get("result")
+            if not isinstance(result, dict) or result.get("id") != rec["id"]:
+                raise CloudflareError("DELETE result does not confirm the requested record id")
+            gone.append(rec["id"])
         return gone
-__V6DDNS_ALIDNS_PY__
-	info "已安装 $LIBDIR/alidns.py (mode 644)"
+__V6DDNS_CLOUDFLARE_PY__
+	info "已安装 $LIBDIR/cloudflare.py (mode 644)"
 	install -m644 /dev/stdin "$LIBDIR/ipv6state.py" <<'__V6DDNS_IPV6STATE_PY__'
 """Read the host's real IPv6 state and tell stale addresses apart from live ones.
 
@@ -327,24 +497,17 @@ State:       /var/lib/v6-ddns/address
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "v6ddns"))
-import alidns
+import cloudflare
 import ipv6state
 
-ENV_FILE = alidns.ENV_FILE
-STATE_FILE = alidns.STATE_FILE
-
-DEFAULT_TTL = {"cloudflare": 120, "alidns": 600, "dnspod": 600}
-UA = "v6-ddns/1"
+ENV_FILE = cloudflare.ENV_FILE
+STATE_FILE = cloudflare.STATE_FILE
 
 
 def die(msg):
@@ -361,27 +524,20 @@ def run(cmd):
 
 
 def load_config():
-    cfg = {}
     try:
-        with open(ENV_FILE) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                cfg[key.strip()] = val.strip().strip("'\"")
+        cfg = cloudflare.load_env(ENV_FILE)
     except FileNotFoundError:
         die(f"missing {ENV_FILE}")
-    for key in ("V6DDNS_PROVIDER", "V6DDNS_DOMAIN", "V6DDNS_TOKEN"):
+    for key in ("V6DDNS_PROVIDER", "V6DDNS_DOMAIN", "V6DDNS_TOKEN", "V6DDNS_ZONE_ID"):
         if not cfg.get(key):
             die(f"{key} is not set in {ENV_FILE}")
     if not cfg.get("V6DDNS_HOST"):
         cfg["V6DDNS_HOST"] = "@"
     provider = cfg["V6DDNS_PROVIDER"].lower()
-    if provider not in DEFAULT_TTL:
-        die(f"unknown provider {provider!r}; use cloudflare, alidns or dnspod")
+    if provider != "cloudflare":
+        die(f"unsupported provider {provider!r}; use cloudflare")
     cfg["V6DDNS_PROVIDER"] = provider
-    cfg.setdefault("V6DDNS_TTL", str(DEFAULT_TTL[provider]))
+    cfg.setdefault("V6DDNS_TTL", "120")
     return cfg
 
 
@@ -418,105 +574,6 @@ def fqdn(cfg):
     return f"{host}.{cfg['V6DDNS_DOMAIN']}"
 
 
-def warn_duplicates(records, name):
-    """Only record[0] gets updated; a leftover stale AAAA breaks clients."""
-    if len(records) > 1:
-        log(f"WARNING: {len(records)} AAAA records exist for {name}; only the first is "
-            f"kept in sync -- delete the others or clients will round-robin onto a "
-            f"stale address")
-
-
-def request(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        die(f"{url} -> HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:600]}")
-    except urllib.error.URLError as exc:
-        die(f"{url} -> {exc.reason}")
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        die(f"{url} -> non-JSON response: {body[:200]}")
-
-
-# --- providers ---------------------------------------------------------------
-
-
-def cloudflare(cfg, addr):
-    fq = fqdn(cfg)
-    base = "https://api.cloudflare.com/client/v4"
-    auth = {"Authorization": f"Bearer {cfg['V6DDNS_TOKEN']}", "Content-Type": "application/json"}
-
-    def api(path, method="GET", payload=None):
-        reply = request(base + path, data=json.dumps(payload).encode() if payload else None,
-                        headers=auth)
-        if not reply.get("success"):
-            die(f"cloudflare {path} failed: {reply.get('errors')}")
-        return reply["result"]
-
-    zones = api(f"/zones?name={urllib.parse.quote(cfg['V6DDNS_DOMAIN'])}")
-    if not zones:
-        die(f"cloudflare zone {cfg['V6DDNS_DOMAIN']} not found (check the token)")
-    zid = zones[0]["id"]
-    existing = api(f"/zones/{zid}/dns_records?type=AAAA&name={urllib.parse.quote(fq)}")
-    warn_duplicates(existing, fq)
-    record = {"type": "AAAA", "name": fq, "content": addr, "ttl": int(cfg["V6DDNS_TTL"])}
-    if existing:
-        api(f"/zones/{zid}/dns_records/{existing[0]['id']}", "PUT", record)
-        return f"updated AAAA {fq} (id {existing[0]['id']})"
-    created = api(f"/zones/{zid}/dns_records", "POST", record)
-    return f"created AAAA {fq} (id {created['id']})"
-
-
-def alidns_provider(cfg, addr):
-    name = fqdn(cfg)
-    client = alidns.Client.from_env(ENV_FILE)
-    found = client.records(f"{cfg['V6DDNS_HOST']}.{cfg['V6DDNS_DOMAIN']}", "AAAA")
-    warn_duplicates(found, name)
-    outcome = client.set_record(cfg["V6DDNS_DOMAIN"], cfg["V6DDNS_HOST"], "AAAA", addr,
-                                cfg["V6DDNS_TTL"])
-    return f"AAAA {name} {outcome}"
-
-
-def dnspod(cfg, addr):
-    creds = cfg["V6DDNS_TOKEN"]
-    if "," not in creds:
-        die("V6DDNS_TOKEN for dnspod must be '<ID>,<Token>'")
-    auth = f"login_token={creds}&format=json&lang=en&error_on_empty=no"
-
-    def call(action, extra):
-        body = urllib.parse.urlencode(extra).encode()
-        reply = request(f"https://dnsapi.cn/{action}?{auth}", data=body,
-                        headers={"Content-Type": "application/x-www-form-urlencoded",
-                                 "Accept": "application/json"})
-        status = reply.get("status", {})
-        if str(status.get("code")) != "1":
-            die(f"dnspod {action} failed: {status.get('message')}")
-        return reply
-
-    where = {"domain": cfg["V6DDNS_DOMAIN"], "sub_domain": cfg["V6DDNS_HOST"]}
-    found = call("Record.List", {**where, "record_type": "AAAA"}).get("records") or []
-    warn_duplicates(found, fqdn(cfg))
-    if found:
-        call("Record.Modify", {
-            **where,
-            "record_id": found[0]["id"],
-            "record_type": "AAAA",
-            "record_line": found[0]["line"],
-            "value": addr,
-            "ttl": int(cfg["V6DDNS_TTL"]),
-        })
-        return f"updated AAAA {fqdn(cfg)} (id {found[0]['id']})"
-    call("Record.Create", {**where, "record_type": "AAAA", "record_line": "默认", "value": addr,
-                            "ttl": int(cfg["V6DDNS_TTL"])})
-    return f"created AAAA {fqdn(cfg)}"
-
-
-PROVIDERS = {"cloudflare": cloudflare, "alidns": alidns_provider, "dnspod": dnspod}
-
-
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--print", dest="show", action="store_true")
@@ -546,7 +603,8 @@ def main():
               f"{'' if previous is None else f' (was {previous})'} via {cfg['V6DDNS_PROVIDER']}")
         return
 
-    outcome = PROVIDERS[cfg["V6DDNS_PROVIDER"]](cfg, addr)
+    client = cloudflare.Client.from_env(ENV_FILE)
+    outcome = client.set_aaaa(fqdn(cfg), addr, int(cfg["V6DDNS_TTL"]))
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as fh:
         fh.write(addr + "\n")
@@ -554,69 +612,60 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (cloudflare.CloudflareError, OSError, ValueError) as exc:
+        die(str(exc))
 __V6DDNS_V6DDNS__
 	info "已安装 $BINDIR/v6-ddns (mode 755)"
-	install -m755 /dev/stdin "$BINDIR/alidns-dns01" <<'__V6DDNS_ALIYUN_HOOK__'
+	install -m755 /dev/stdin "$BINDIR/cloudflare-dns01" <<'__V6DDNS_CLOUDFLARE_HOOK__'
 #!/usr/bin/env python3
-"""certbot DNS-01 hook for Alibaba Cloud DNS.
-
-Used because HTTP-01 cannot work here: b-b.icu is AAAA-only, and Let's Encrypt's
-validation nodes time out reaching this China Telecom residential IPv6 from the
-outside (26/26 probes from other networks succeed, so the path itself is fine).
-
-  auth     create/update the _acme-challenge TXT record
-  cleanup  delete it
-
-certbot invocation (the env file and the state path are world-independent):
-  --manual-auth-hook    '/usr/local/bin/alidns-dns01 auth'
-  --manual-cleanup-hook '/usr/local/bin/alidns-dns01 cleanup'
-
-Reads the domain and credentials from /etc/v6-ddns/env.
-"""
+"""certbot DNS-01 hook：auth 添加挑战，cleanup 仅删除对应挑战值。"""
 
 import os
 import sys
+import time
 
-# The env file is in /etc, so certbot and v6-ddns.service read the same one with
-# no per-user path juggling.
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "v6ddns"))
-import alidns
+import cloudflare
 
-ENV_FILE = alidns.ENV_FILE
-PREFIX = "_acme-challenge"
+ENV_FILE = cloudflare.ENV_FILE
 
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "auth"
-    domain = os.environ.get("CERTBOT_DOMAIN")
+    if mode not in ("auth", "cleanup"):
+        sys.exit(f"cloudflare-dns01: unknown mode {mode!r} (expected auth or cleanup)")
+    domain = os.environ.get("CERTBOT_DOMAIN", "").lower().rstrip(".")
     validation = os.environ.get("CERTBOT_VALIDATION", "")
-    if not domain:
-        sys.exit("alidns-dns01: CERTBOT_DOMAIN is not set")
-
-    cfg = alidns.load_env(ENV_FILE)
-    zone = cfg["V6DDNS_DOMAIN"]
-    client = alidns.Client.from_env(ENV_FILE)
-
+    if not domain or not validation:
+        sys.exit("cloudflare-dns01: CERTBOT_DOMAIN and CERTBOT_VALIDATION are required")
+    if domain.startswith("*."):
+        domain = domain[2:]
+    cfg = cloudflare.load_env(ENV_FILE)
+    zone = cfg.get("V6DDNS_DOMAIN", "").lower().rstrip(".")
+    if (not zone or "*" in domain
+            or not (domain == zone or domain.endswith("." + zone))):
+        sys.exit("cloudflare-dns01: CERTBOT_DOMAIN is outside V6DDNS_DOMAIN")
+    name = f"_acme-challenge.{domain}"
+    client = cloudflare.Client.from_env(ENV_FILE)
     if mode == "auth":
-        if not validation:
-            sys.exit("alidns-dns01: CERTBOT_VALIDATION is not set")
-        print(client.set_record(zone, PREFIX, "TXT", validation))
-    elif mode == "cleanup":
-        gone = client.delete_matching(zone, PREFIX, "TXT", validation or None)
-        print(f"removed {len(gone)} TXT record(s)" if gone else "nothing to remove")
+        rid = client.add_txt(name, validation)
+        print(f"created TXT {name} (id {rid})")
+        time.sleep(30)
     else:
-        sys.exit(f"alidns-dns01: unknown mode {mode!r} (expected auth or cleanup)")
+        gone = client.delete_txt(name, validation)
+        print(f"removed {len(gone)} TXT record(s)" if gone else "nothing to remove")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except alidns.AlidnsError as exc:
-        sys.exit(f"alidns-dns01: {exc}")
-__V6DDNS_ALIYUN_HOOK__
-	info "已安装 $BINDIR/alidns-dns01 (mode 755)"
+    except (cloudflare.CloudflareError, OSError) as exc:
+        sys.exit(f"cloudflare-dns01: {exc}")
+__V6DDNS_CLOUDFLARE_HOOK__
+	info "已安装 $BINDIR/cloudflare-dns01 (mode 755)"
 	install -m755 /dev/stdin "$BINDIR/v6-stale-sweep" <<'__V6DDNS_V6STALE__'
 #!/usr/bin/env python3
 """Delete global IPv6 addresses whose prefix the router no longer advertises.
@@ -744,10 +793,10 @@ __V6DDNS_SWEEP_TIMER__
 	info "已安装 $UNITDIR/v6-stale-sweep.timer (mode 644)"
 if [ "$DO_NGINX" = 1 ]; then
 	install -m644 /dev/stdin "$NGINXDIR/$DOMAIN.conf" <<'__V6DDNS_NGINX_VHOST__'
-# @DOMAIN@ -- install as /etc/nginx/conf.d/@DOMAIN@.conf
+# example.com -- install as /etc/nginx/conf.d/example.com.conf
 #
 # Deliberately does NOT declare default_server, so it coexists with the Debian
-# default site in sites-enabled: requests for @DOMAIN@ match by server_name here,
+# default site in sites-enabled: requests for example.com match by server_name here,
 # anything else keeps falling through to the stock catch-all vhost.
 #
 # Port 80 only redirects; the certificate is issued via DNS-01, so nothing has
@@ -758,7 +807,7 @@ if [ "$DO_NGINX" = 1 ]; then
 server {
 	listen 80;
 	listen [::]:80;
-	server_name @DOMAIN@;
+	server_name example.com;
 
 	# The certificate is issued via DNS-01, so nothing here needs to be reachable
 	# for renewal -- port 80 is free to redirect unconditionally.  $request_uri
@@ -769,13 +818,13 @@ server {
 server {
 	listen 443 ssl;
 	listen [::]:443 ssl;
-	server_name @DOMAIN@;
+	server_name example.com;
 
 	root /var/www/html;
 	index index.html index.htm index.nginx-debian.html;
 
-	ssl_certificate     /etc/letsencrypt/live/@DOMAIN@/fullchain.pem;
-	ssl_certificate_key /etc/letsencrypt/live/@DOMAIN@/privkey.pem;
+	ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 
 	# Session/cipher/protocol settings come from this file -- declaring them here
 	# too is a hard "directive is duplicate" error at nginx -t.
@@ -787,7 +836,7 @@ server {
 	}
 }
 __V6DDNS_NGINX_VHOST__
-	sed -i "s|@DOMAIN@|$DOMAIN|g" "$NGINXDIR/$DOMAIN.conf"
+	sed -i "s|example\.com|$DOMAIN|g" "$NGINXDIR/$DOMAIN.conf"
 	info "已安装 nginx vhost (mode 644)"
 fi
 
@@ -797,17 +846,46 @@ systemctl enable --now v6-ddns.timer v6-stale-sweep.timer
 systemctl list-timers 'v6-*' --no-pager || true
 info "证书有效期 $(cat /etc/letsencrypt/live/$DOMAIN/fullchain.pem 2>/dev/null | openssl x509 -enddate -noout 2>/dev/null | cut -d= -f2)"
 
-step "完成"
 if [ "$ISSUE_CERT" = 1 ]; then
   step "申请证书 (DNS-01)"
-  certbot certonly --manual --preferred-challenges dns \
-    --manual-auth-hook    "$BINDIR/alidns-dns01 auth" \
-    --manual-cleanup-hook "$BINDIR/alidns-dns01 cleanup" \
+  RENEWAL_FILE="/etc/letsencrypt/renewal/$DOMAIN.conf"
+  DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/v6-ddns-nginx-$DOMAIN"
+  # Certbot 读取前修复旧脚本产生的重复键，仅删除脚本自己的确切命令。
+  if [ -f "$RENEWAL_FILE" ]; then
+    sed -i '/^[[:space:]]*renew_hook[[:space:]]*=[[:space:]]*systemctl reload nginx[[:space:]]*$/d' "$RENEWAL_FILE"
+  fi
+  if [ "$DO_NGINX" = 0 ]; then
+    rm -f "$DEPLOY_HOOK"
+  fi
+  if [ -f "$RENEWAL_FILE" ]; then
+    certbot reconfigure --cert-name "$DOMAIN" --manual --preferred-challenges dns \
+      --manual-auth-hook "$BINDIR/cloudflare-dns01 auth" \
+      --manual-cleanup-hook "$BINDIR/cloudflare-dns01 cleanup" --non-interactive
+  else
+    certbot certonly --cert-name "$DOMAIN" --manual --preferred-challenges dns \
+      --non-interactive \
+    --manual-auth-hook    "$BINDIR/cloudflare-dns01 auth" \
+    --manual-cleanup-hook "$BINDIR/cloudflare-dns01 cleanup" \
     -d "$DOMAIN"
-  echo 'renew_hook = systemctl reload nginx' >> "/etc/letsencrypt/renewal/$DOMAIN.conf"
-  nginx -t && systemctl reload nginx
+  fi
+  check_lineage saved
+  if [ "$DO_NGINX" = 1 ]; then
+    install -d -m755 "/etc/letsencrypt/renewal-hooks/deploy"
+    cat > "$DEPLOY_HOOK" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# 仅刷新本安装域名对应的 lineage，不影响其他证书。
+[ "\${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/$DOMAIN" ] || exit 0
+nginx -t
+systemctl reload nginx
+EOF
+    chmod 755 "$DEPLOY_HOOK"
+    nginx -t
+    systemctl reload nginx
+  fi
 fi
 
+step "完成"
 step "验证"
 "$BINDIR/v6-ddns" --print | sed 's/^/  当前地址: /'
 systemctl --no-pager --full status v6-ddns.service 2>/dev/null | head -3 || true

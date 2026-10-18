@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""certbot DNS-01 hook：auth 添加挑战，cleanup 仅删除对应挑战值。"""
+
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "v6ddns"))
+import cloudflare
+
+ENV_FILE = cloudflare.ENV_FILE
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "auth"
+    if mode not in ("auth", "cleanup"):
+        sys.exit(f"cloudflare-dns01: unknown mode {mode!r} (expected auth or cleanup)")
+    domain = os.environ.get("CERTBOT_DOMAIN", "").lower().rstrip(".")
+    validation = os.environ.get("CERTBOT_VALIDATION", "")
+    if not domain or not validation:
+        sys.exit("cloudflare-dns01: CERTBOT_DOMAIN and CERTBOT_VALIDATION are required")
+    if domain.startswith("*."):
+        domain = domain[2:]
+    cfg = cloudflare.load_env(ENV_FILE)
+    zone = cfg.get("V6DDNS_DOMAIN", "").lower().rstrip(".")
+    if (not zone or "*" in domain
+            or not (domain == zone or domain.endswith("." + zone))):
+        sys.exit("cloudflare-dns01: CERTBOT_DOMAIN is outside V6DDNS_DOMAIN")
+    name = f"_acme-challenge.{domain}"
+    client = cloudflare.Client.from_env(ENV_FILE)
+    if mode == "auth":
+        rid = client.add_txt(name, validation)
+        print(f"created TXT {name} (id {rid})")
+        time.sleep(30)
+    else:
+        gone = client.delete_txt(name, validation)
+        print(f"removed {len(gone)} TXT record(s)" if gone else "nothing to remove")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (cloudflare.CloudflareError, OSError) as exc:
+        sys.exit(f"cloudflare-dns01: {exc}")

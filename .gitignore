@@ -5,5 +5,5 @@
 __pycache__/
 *.pyc
 
-# 凭据模板的同目录实体文件，含明文 AccessKey（见 README「不要进 git」）
+# 凭据模板的同目录实体文件，含明文 Cloudflare API Token（不要进 git）
 /v6ddns/env
